@@ -4,6 +4,7 @@ const express = require('express');
 const crypto = require('./crypto');
 const { mountApi } = require('./api');
 const { mountHooks } = require('./hooks');
+const { makeAccess } = require('./access');
 
 function parseCookies(header) {
   const out = {};
@@ -18,8 +19,10 @@ function createApp({ pool, env }) {
   if (!env.APP_SECRET || env.APP_SECRET.length < 16) throw new Error('APP_SECRET must be set (16+ chars)');
   const publicUrl = (env.PUBLIC_URL || '').replace(/\/+$/, '');
   const secure = publicUrl.startsWith('https://');
-  const ctx = { pool, env, publicUrl, secure, secret: env.APP_SECRET };
+  const access = makeAccess(pool);
+  const ctx = { pool, env, publicUrl, secure, secret: env.APP_SECRET, access };
 
+  // `user.tenant_id` is the business the session is currently "in" (switchable).
   ctx.setSession = (res, user) => {
     const token = crypto.sign({ u: user.id, t: user.tenant_id, exp: Math.floor(Date.now() / 1000) + 30 * 86400 }, ctx.secret);
     res.setHeader('Set-Cookie', `sid=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${30 * 86400}${secure ? '; Secure' : ''}`);
@@ -47,10 +50,7 @@ function createApp({ pool, env }) {
         return res.status(403).json({ error: 'Missing X-Requested-With header' });
       }
       const s = crypto.verify(parseCookies(req.headers.cookie).sid, ctx.secret);
-      if (s) {
-        const { rows } = await pool.query('SELECT id, tenant_id, email, name, role FROM users WHERE id = $1 AND tenant_id = $2', [s.u, s.t]);
-        req.user = rows[0] || null;
-      }
+      if (s) req.user = await access.loadUser(s.u, s.t);
       next();
     } catch (e) { next(e); }
   });

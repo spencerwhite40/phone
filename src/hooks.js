@@ -54,9 +54,9 @@ function mountHooks(app, ctx) {
     if (!found) return;
     const { n } = found;
     const userId = userIdFromIdentity(req.body.From || req.body.Caller);
-    const u = userId && (await q('SELECT 1 FROM users WHERE id = $1 AND tenant_id = $2', [userId, n.tenant_id])).rows[0];
+    const allowedUser = userId && (await ctx.access.canUseNumber(userId, n));
     const to = toE164(req.body.To);
-    if (!u) return xml(res, twiml('<Reject/>'));
+    if (!allowedUser) return xml(res, twiml('<Reject/>'));
     if (!to) return xml(res, twiml('<Say>That number is not valid.</Say>'));
     await upsertCall(n, 'out', to, req.body.CallSid);
     xml(res, twiml(
@@ -79,13 +79,32 @@ function mountHooks(app, ctx) {
     const { n } = found;
     const from = toE164(req.body.From) || req.body.From || 'unknown';
     await upsertCall(n, 'in', from, req.body.CallSid);
-    const users = (await q('SELECT id FROM users WHERE tenant_id = $1', [n.tenant_id])).rows;
-    const targets = users.map((u) => `<Client>${identityFor(u.id)}</Client>`).join('')
-      + (n.forward_to ? `<Number>${esc(n.forward_to)}</Number>` : '');
-    if (!targets) return xml(res, twiml(voicemailPrompt(n)));
-    xml(res, twiml(
-      `<Dial timeout="${n.ring_seconds}" answerOnBridge="true" action="${esc(hook(`dialdone/${n.id}`))}">${targets}</Dial>`));
+    const targets = await ringTargets(n);
+    if (!targets.length) return xml(res, twiml(voicemailPrompt(n)));
+    xml(res, twiml(dialXml(n, targets, 0)));
   }));
+
+  // Who rings: the people assigned to this number, in order. A number nobody is assigned to
+  // rings the business's owners/admins so a call is never dropped. Forwarding cell comes last.
+  async function ringTargets(n) {
+    let users = (await q(
+      `SELECT user_id AS id FROM number_members WHERE number_id = $1 ORDER BY position, created_at`, [n.id])).rows;
+    if (!users.length) {
+      users = (await q(
+        "SELECT user_id AS id FROM memberships WHERE tenant_id = $1 AND role IN ('owner','admin') ORDER BY created_at", [n.tenant_id])).rows;
+    }
+    const targets = users.map((u) => `<Client>${identityFor(u.id)}</Client>`);
+    if (n.forward_to) targets.push(`<Number>${esc(n.forward_to)}</Number>`);
+    return targets;
+  }
+
+  // 'all' rings everyone at once; 'sequence' rings one at a time, moving on when unanswered.
+  function dialXml(n, targets, step) {
+    const sequence = n.ring_mode === 'sequence';
+    const next = sequence ? `${hook(`dialdone/${n.id}`)}?step=${step + 1}` : hook(`dialdone/${n.id}`);
+    const nouns = sequence ? targets[step] : targets.join('');
+    return `<Dial timeout="${n.ring_seconds}" answerOnBridge="true" action="${esc(next)}">${nouns}</Dial>`;
+  }
 
   function voicemailPrompt(n) {
     const greeting = n.greeting_id
@@ -104,6 +123,11 @@ function mountHooks(app, ctx) {
       await q("UPDATE calls SET status = 'completed', seconds = $1 WHERE provider_id = $2 AND tenant_id = $3",
         [num(req.body.DialCallDuration), req.body.CallSid, n.tenant_id]);
       return xml(res, twiml());
+    }
+    if (n.ring_mode === 'sequence') {
+      const step = num(req.query.step);
+      const targets = await ringTargets(n);
+      if (step < targets.length) return xml(res, twiml(dialXml(n, targets, step)));
     }
     await q("UPDATE calls SET status = 'missed' WHERE provider_id = $1 AND tenant_id = $2", [req.body.CallSid, n.tenant_id]);
     xml(res, twiml(voicemailPrompt(n)));

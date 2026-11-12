@@ -17,9 +17,25 @@ It is a standalone app with its own
 | Voicemail greeting per number (record in browser or upload any audio) | Yes | No |
 | SMS send and receive, threads, unread badges | Yes | Yes |
 
-Multi-tenant: each company signs up on its own, connects its own Twilio and/or Bird account,
-and only ever sees its own numbers, messages, voicemail and greetings. The owner can add team
-members, who all ring together on inbound calls.
+## Businesses, people and numbers
+
+One operator login runs many businesses. The first account created on a fresh install is the **operator**:
+it can open every business, create new ones, and assign numbers to them. You connect your own Twilio and Bird
+accounts once, then give each business the numbers it should have.
+
+| Role | Can do |
+|---|---|
+| Operator | Everything, in every business: create businesses, move numbers between them, manage providers |
+| Owner | Run one business: providers, people, every number in it |
+| Admin | Add people, assign them to numbers, change number settings (not roles or providers) |
+| Member | Only the numbers assigned to them: calls, texts, voicemail, and their own voicemail greetings |
+
+- **Routing:** inbound calls to a number ring the people assigned to it, all at once or one at a time in the order you set.
+  A number nobody is assigned to rings the owners and admins, so a call is never dropped. An optional cell number rings too.
+- **Greetings:** anyone assigned to a number can record or upload its voicemail greeting right on that number's card.
+- **People in several businesses:** adding someone who already has a login attaches them to the new business. They keep one
+  password and switch businesses from the top bar.
+- **Moving a number** to another business takes its texts, calls and voicemail with it, and clears who was assigned.
 
 **Bird calls are not in v1.** Bird's voice product is SIP-trunk based and has no browser calling.
 The practical route is to point a Bird number's SIP trunk at Twilio, after which it is a Twilio number
@@ -55,12 +71,13 @@ plus a Postgres database and the env vars above. Use the generated `https://…o
 
 ## Connect your numbers
 
-1. Open the app, **Create a company**, then go to **Settings → Providers**.
+1. Open the app, **Create a company** (the first account becomes the operator), then go to **Settings → Providers**.
 2. **Twilio:** paste the Account SID and Auth Token. The app creates an API key and a calling app,
    imports every number on the account, and points each number's voice and SMS webhooks at itself. Use **Sync** later to pick up new numbers.
 3. **Bird:** paste an access key (Application Developer role), workspace ID, SMS channel ID and the channel's number,
    then copy the webhook URL shown into Bird so inbound texts arrive.
-4. **Settings → Voicemail greetings:** record or upload, then choose it for each number under **Numbers**.
+4. **Settings → Businesses:** create each business and assign numbers to it. **People:** add staff and tick their numbers.
+5. **Settings → Numbers:** set the ring order and record or upload each number's voicemail greeting.
 
 Add to home screen: iPhone Share → Add to Home Screen; Android ⋮ → Install app; desktop: the install icon in the address bar.
 

@@ -32,13 +32,25 @@ test('call, voicemail, SMS and tenant isolation', { skip: URL_ ? false : 'PHONE_
   const signup = async (company, email) => {
     const r = await fetch(base + '/api/signup', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'phone' }, body: JSON.stringify({ company, email, password: 'password123' }) });
     assert.equal(r.status, 200);
-    const cookie = r.headers.get('set-cookie').split(';')[0];
     const body = await r.json();
-    const call = (method, path, data, raw) => fetch(base + '/api' + path, {
-      method, headers: { Cookie: cookie, 'X-Requested-With': 'phone', ...(data && !raw ? { 'Content-Type': 'application/json' } : {}) },
-      body: raw ? data : data ? JSON.stringify(data) : undefined,
-    });
-    return { user: body.user, call };
+    return { user: body.user, call: caller(r.headers.get('set-cookie').split(';')[0]) };
+  };
+  // A caller keeps its cookie, and follows a business switch (the server rotates it).
+  const caller = (initial) => {
+    let cookie = initial;
+    return async (method, path, data, raw) => {
+      const res = await fetch(base + '/api' + path, {
+        method, headers: { Cookie: cookie, 'X-Requested-With': 'phone', ...(data && !raw ? { 'Content-Type': 'application/json' } : {}) },
+        body: raw ? data : data ? JSON.stringify(data) : undefined,
+      });
+      if (path === '/switch' && res.headers.get('set-cookie')) cookie = res.headers.get('set-cookie').split(';')[0];
+      return res;
+    };
+  };
+  const loginAs = async (email, password) => {
+    const r = await fetch(base + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'phone' }, body: JSON.stringify({ email, password }) });
+    assert.equal(r.status, 200);
+    return { me: await r.json(), call: caller(r.headers.get('set-cookie').split(';')[0]) };
   };
   const seedNumber = async (tenantId, e164, provider = 'twilio', partial = false) => {
     const full = { accountSid: 'AC' + 'a'.repeat(32), authToken: TOKEN, apiKeySid: 'SK' + 'b'.repeat(32), apiKeySecret: 'keysecret', appSid: 'AP' + 'c'.repeat(32) };
@@ -189,18 +201,158 @@ test('call, voicemail, SMS and tenant isolation', { skip: URL_ ? false : 'PHONE_
     assert.equal(bad.status, 400); assert.match((await bad.json()).error, /connect again/);
   });
 
-  await t.test('greeting upload rejects non-WAV; csrf header is enforced; members cannot manage', async () => {
+  await t.test('greeting upload rejects non-WAV; csrf header is enforced', async () => {
     assert.equal((await A.call('POST', '/greetings?name=x', Buffer.from('ID3 not a wav'.repeat(200)), true)).status, 415);
     const noHeader = await fetch(base + '/api/messages', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
     assert.equal(noHeader.status, 403);
+  });
+
+  const wavBuf = () => Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WAVE'), Buffer.alloc(2000)]);
+  const a2 = await seedNumber(A.user.tenant_id, '+15550000011');
+  let dee; let deeId;
+
+  await t.test('the operator is the first account; later signups are ordinary owners', async () => {
+    assert.equal(A.user.is_platform_admin, true);
+    assert.equal(B.user.is_platform_admin, false);
+    assert.equal((await B.call('POST', '/businesses', { name: 'Nope' })).status, 403);
+    assert.equal((await B.call('GET', '/admin/numbers')).status, 403);
+  });
+
+  await t.test('members see and use only the numbers assigned to them', async () => {
     const add = await A.call('POST', '/team', { name: 'Dee', email: 'dee@x.co', password: 'password123' });
-    assert.equal(add.status, 200);
-    const login = await fetch(base + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'phone' }, body: JSON.stringify({ email: 'dee@x.co', password: 'password123' }) });
-    const dee = login.headers.get('set-cookie').split(';')[0];
-    const call = (method, path, data) => fetch(base + '/api' + path, { method, headers: { Cookie: dee, 'X-Requested-With': 'phone', 'Content-Type': 'application/json' }, body: data ? JSON.stringify(data) : undefined });
-    assert.equal((await call('PATCH', `/numbers/${a.numberId}`, { label: 'x' })).status, 403);
-    assert.equal((await call('POST', '/team', { email: 'z@x.co', password: 'password123' })).status, 403);
-    assert.equal((await call('GET', '/numbers')).status, 200, 'members can still use the app');
+    assert.equal(add.status, 200); deeId = (await add.json()).id;
+    dee = await loginAs('dee@x.co', 'password123');
+    assert.equal((await (await dee.call('GET', '/numbers')).json()).numbers.length, 0, 'unassigned member sees nothing');
+    assert.equal((await dee.call('GET', '/team')).status, 403);
+
+    assert.equal((await A.call('PATCH', `/team/${deeId}`, { numberIds: [a.numberId] })).status, 200);
+    const mine = (await (await dee.call('GET', '/numbers')).json()).numbers;
+    assert.deepEqual(mine.map((n) => n.id), [a.numberId]);
+    assert.deepEqual(mine[0].people.map((p) => p.id), [deeId]);
+
+    // activity on the other number is invisible and unusable
+    await pool.query("INSERT INTO messages (tenant_id, number_id, direction, peer, body, read) VALUES ($1,$2,'in','+15551119999','secret',false)", [A.user.tenant_id, a2.numberId]);
+    await pool.query("INSERT INTO voicemails (tenant_id, number_id, peer, recording_url, seconds, provider_id) VALUES ($1,$2,'+15551119999','https://api.twilio.com/x',5,'RE-a2')", [A.user.tenant_id, a2.numberId]);
+    const th = (await (await dee.call('GET', '/threads')).json()).threads;
+    assert.ok(th.every((x) => x.number_id === a.numberId));
+    assert.ok((await (await dee.call('GET', '/voicemails')).json()).voicemails.every((v) => v.number_id === a.numberId));
+    assert.equal((await (await dee.call('GET', `/thread?numberId=${a2.numberId}&peer=${encodeURIComponent('+15551119999')}`)).json()).messages.length, 0);
+    assert.equal((await dee.call('POST', '/messages', { numberId: a2.numberId, to: '+15551119999', body: 'x' })).status, 404);
+    assert.equal((await dee.call('GET', `/voice/token?numberId=${a2.numberId}`)).status, 404);
+    const sum = await (await dee.call('GET', '/summary')).json();
+    const all = await (await A.call('GET', '/summary')).json();
+    assert.ok(all.unreadMessages > sum.unreadMessages, 'badges are scoped too');
+  });
+
+  await t.test('a member can set voicemail greetings for their number, but nothing else', async () => {
+    assert.equal((await dee.call('PATCH', `/numbers/${a.numberId}`, { label: 'x' })).status, 403);
+    assert.equal((await dee.call('PATCH', `/numbers/${a.numberId}`, { forward_to: '+15550001234' })).status, 403);
+    assert.equal((await dee.call('PATCH', `/numbers/${a2.numberId}`, { greeting_id: null })).status, 404);
+    const up = await dee.call('POST', `/greetings?name=Dee%20greeting&seconds=9&numberId=${a.numberId}`, wavBuf(), true);
+    assert.equal(up.status, 200);
+    const gid = (await up.json()).greeting.id;
+    const n = (await (await dee.call('GET', '/numbers')).json()).numbers[0];
+    assert.equal(n.greeting_id, gid, 'uploaded greeting becomes active for that number');
+    assert.equal((await dee.call('POST', `/greetings?name=x&numberId=${a2.numberId}`, wavBuf(), true)).status, 404);
+    assert.equal((await dee.call('POST', '/greetings?name=x', wavBuf(), true)).status, 403, 'no business-wide library for members');
+    const xml = await (await hook(`/hooks/twilio/voice/dialdone/${a.numberId}`, { CallSid: 'CAg1', DialCallStatus: 'no-answer' })).text();
+    assert.match(xml, new RegExp(`/greeting/${gid}\\.wav`));
+    const ownerGreeting = (await (await A.call('GET', '/greetings')).json()).greetings.find((g) => g.name === 'Hours');
+    assert.equal((await dee.call('DELETE', `/greetings/${ownerGreeting.id}`)).status, 403, "can't delete someone else's greeting");
+    assert.equal((await dee.call('DELETE', `/greetings/${gid}`)).status, 200);
+  });
+
+  await t.test('inbound calls ring only the people assigned, in order when set to sequence', async () => {
+    await pool.query('UPDATE numbers SET forward_to = NULL WHERE id = $1', [a2.numberId]);
+    // nobody assigned -> owners/admins, so a call is never dropped
+    let xml = await (await hook(`/hooks/twilio/voice/in/${a2.numberId}`, { CallSid: 'CAr0', From: '+15552220000' })).text();
+    assert.match(xml, new RegExp(identityFor(A.user.id)));
+    assert.ok(!xml.includes(identityFor(deeId)));
+
+    assert.equal((await A.call('PATCH', `/numbers/${a2.numberId}`, { people: [deeId, A.user.id], ring_mode: 'sequence' })).status, 200);
+    xml = await (await hook(`/hooks/twilio/voice/in/${a2.numberId}`, { CallSid: 'CAr1', From: '+15552220000' })).text();
+    assert.ok(xml.includes(identityFor(deeId)) && !xml.includes(identityFor(A.user.id)), 'first target only');
+    xml = await (await hook(`/hooks/twilio/voice/dialdone/${a2.numberId}?step=1`, { CallSid: 'CAr1', DialCallStatus: 'no-answer' })).text();
+    assert.ok(xml.includes(identityFor(A.user.id)) && !xml.includes(identityFor(deeId)), 'second target next');
+    assert.match(xml, /dialdone\/[0-9a-f-]+\?step=2/);
+    xml = await (await hook(`/hooks/twilio/voice/dialdone/${a2.numberId}?step=2`, { CallSid: 'CAr1', DialCallStatus: 'no-answer' })).text();
+    assert.match(xml, /<Record /, 'everyone tried -> voicemail');
+
+    assert.equal((await A.call('PATCH', `/numbers/${a2.numberId}`, { ring_mode: 'all' })).status, 200);
+    xml = await (await hook(`/hooks/twilio/voice/in/${a2.numberId}`, { CallSid: 'CAr2', From: '+15552220000' })).text();
+    assert.ok(xml.includes(identityFor(deeId)) && xml.includes(identityFor(A.user.id)), 'all at once');
+    assert.equal((await A.call('PATCH', `/numbers/${a2.numberId}`, { ring_mode: 'bogus' })).status, 400);
+  });
+
+  await t.test('outbound calls need access to that specific number', async () => {
+    const out = (uid, numberId) => hook('/hooks/twilio/voice/out', { CallSid: `CAo${Math.random()}`, From: `client:${identityFor(uid)}`, numberId, To: '+15557778888' }).then((r) => r.text());
+    assert.match(await out(deeId, a.numberId), /<Dial /);
+    assert.match(await out(deeId, a2.numberId), /<Dial /, 'Dee is assigned to a2 too by now');
+    await A.call('PATCH', `/numbers/${a2.numberId}`, { people: [A.user.id] });
+    assert.match(await out(deeId, a2.numberId), /<Reject\/>/, 'no longer assigned');
+  });
+
+  await t.test('operator creates businesses, switches into them and moves numbers', async () => {
+    const created = await (await A.call('POST', '/businesses', { name: 'Gamma Logistics' })).json();
+    const gamma = created.business.id;
+    assert.equal((await B.call('POST', '/switch', { tenantId: gamma })).status, 403, 'another owner cannot enter Gamma');
+    const sw = await A.call('POST', '/switch', { tenantId: gamma });
+    assert.equal(sw.status, 200); assert.equal((await sw.json()).company, 'Gamma Logistics');
+    assert.equal((await (await A.call('GET', '/numbers')).json()).numbers.length, 0, 'fresh business is empty');
+
+    assert.equal((await A.call('POST', `/numbers/${a2.numberId}/move`, { tenantId: gamma })).status, 200);
+    const moved = (await (await A.call('GET', '/numbers')).json()).numbers;
+    assert.deepEqual(moved.map((n) => n.id), [a2.numberId]);
+    assert.equal(moved[0].people.length, 0, 'assignments reset on move');
+    const th = (await (await A.call('GET', '/threads')).json()).threads;
+    assert.ok(th.some((x) => x.number_id === a2.numberId), 'history moves with the number');
+    assert.equal((await dee.call('GET', '/numbers').then((r) => r.json())).numbers.every((n) => n.id !== a2.numberId), true);
+
+    const all = (await (await A.call('GET', '/admin/numbers')).json()).numbers;
+    assert.ok(all.find((n) => n.id === a2.numberId).business === 'Gamma Logistics');
+    assert.equal((await A.call('DELETE', `/businesses/${gamma}`)).status, 400, 'cannot delete the business you are standing in');
+
+    // add an existing person (Dee) to Gamma by email: no password needed, she keeps one login
+    const again = await (await A.call('POST', '/team', { email: 'dee@x.co', numberIds: [a2.numberId] })).json();
+    assert.equal(again.existed, true);
+    const me = await (await dee.call('GET', '/me')).json();
+    assert.equal(me.businesses.length, 2);
+    const inGamma = await dee.call('POST', '/switch', { tenantId: gamma });
+    assert.equal((await inGamma.json()).user.role, 'member');
+    assert.deepEqual((await (await dee.call('GET', '/numbers')).json()).numbers.map((n) => n.id), [a2.numberId]);
+    assert.equal((await dee.call('POST', '/switch', { tenantId: B.user.tenant_id })).status, 403);
+
+    // removing her from Gamma keeps her login and her other business
+    assert.equal((await A.call('DELETE', `/team/${deeId}`)).status, 200);
+    assert.equal((await pool.query('SELECT 1 FROM users WHERE id = $1', [deeId])).rowCount, 1);
+    assert.equal((await dee.call('GET', '/numbers')).status, 401, 'her session inside Gamma stops at once');
+    assert.equal((await (await loginAs('dee@x.co', 'password123')).call('GET', '/me').then((r) => r.json())).businesses.length, 1);
+
+    // businesses with numbers cannot be deleted; empty ones can
+    assert.equal((await A.call('POST', '/switch', { tenantId: A.user.tenant_id })).status, 200);
+    assert.equal((await A.call('DELETE', `/businesses/${gamma}`)).status, 409);
+    assert.equal((await A.call('POST', `/numbers/${a2.numberId}/move`, { tenantId: A.user.tenant_id })).status, 200);
+    assert.equal((await A.call('DELETE', `/businesses/${gamma}`)).status, 200);
+  });
+
+  await t.test('people: roles, last-owner protection, password change, full removal', async () => {
+    assert.equal((await A.call('DELETE', `/team/${A.user.id}`)).status, 400, 'cannot remove yourself');
+    const adminAdd = await A.call('POST', '/team', { name: 'Ann', email: 'ann@x.co', password: 'password123', role: 'admin' });
+    const annId = (await adminAdd.json()).id;
+    const ann = await loginAs('ann@x.co', 'password123');
+    assert.equal(ann.me.user.role, 'admin');
+    assert.equal((await ann.call('GET', '/team')).status, 200);
+    assert.equal((await ann.call('POST', '/team', { email: 'zed@x.co', password: 'password123', role: 'admin' })).status, 403, 'admins cannot mint admins');
+    assert.equal((await ann.call('PATCH', `/team/${deeId}`, { role: 'admin' })).status, 403, 'only the owner changes roles');
+    assert.equal((await A.call('PATCH', `/team/${A.user.id}`, { role: 'member' })).status, 400);
+
+    assert.equal((await ann.call('POST', '/password', { current: 'wrong', next: 'newpassword1' })).status, 400);
+    assert.equal((await ann.call('POST', '/password', { current: 'password123', next: 'newpassword1' })).status, 200);
+    await loginAs('ann@x.co', 'newpassword1');
+
+    assert.equal((await A.call('DELETE', `/team/${annId}`)).status, 200);
+    assert.equal((await pool.query('SELECT 1 FROM users WHERE id = $1', [annId])).rowCount, 0, 'no business left -> account removed');
+    assert.equal((await ann.call('GET', '/numbers')).status, 401, 'their session stops working immediately');
   });
 
   await t.test('login is throttled after repeated failures', async () => {

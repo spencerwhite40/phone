@@ -37,7 +37,7 @@ const ICON = {
 /* ───────── state ───────── */
 const state = {
   me: null, company: '', numbers: [], numberId: store.get('numberId'),
-  tab: 'keypad', summary: { unreadMessages: 0, newVoicemails: 0 }, dialValue: '', vmView: 'voicemail', installEvt: null,
+  tab: 'keypad', businesses: [], settingsTab: 'numbers', summary: { unreadMessages: 0, newVoicemails: 0 }, dialValue: '', vmView: 'voicemail', installEvt: null,
 };
 let pollTimer; let threadTimer;
 
@@ -62,6 +62,7 @@ const numById = (id) => state.numbers.find((n) => n.id === id);
 const numLabel = (n) => (n ? n.label || pretty(n.e164) : '');
 const currentNumber = () => numById(state.numberId) || state.numbers[0] || null;
 const isOwner = () => state.me?.role === 'owner';
+const isAdmin = () => ['owner', 'admin'].includes(state.me?.role);
 
 /* ───────── boot ───────── */
 async function boot() {
@@ -70,9 +71,20 @@ async function boot() {
   window.addEventListener('hashchange', () => { if (state.me) render(); });
   try {
     const me = await api('GET', '/me', undefined, { quiet: true });
-    if (me.user) { state.me = me.user; state.company = me.company; state.needsPublicUrl = me.needsPublicUrl; await afterLogin(); }
+    if (me.user) { applyMe(me); await afterLogin(); }
   } catch { /* show login */ }
   render();
+}
+
+function applyMe(me) {
+  state.me = me.user; state.company = me.company; state.businesses = me.businesses || []; state.needsPublicUrl = me.needsPublicUrl;
+}
+
+// Move the whole app into another business (operators and people who belong to several).
+async function switchBusiness(tenantId) {
+  applyMe(await api('POST', '/switch', { tenantId }));
+  state.numberId = null; state.dialValue = ''; state.settingsTab = 'numbers';
+  await loadNumbers(); location.hash = 'keypad'; render(); registerDevices();
 }
 
 async function afterLogin() {
@@ -118,11 +130,12 @@ function render() {
   state.tab = TABS.some((t) => t[0] === tab) ? tab : 'keypad';
   if (!$('.shell')) {
     put(app, html`<div class="shell">
-      <header class="top"><div class="co">${state.company}</div><select id="asNum" aria-label="Active number"></select></header>
+      <header class="top"><div class="co" id="coName"></div><select id="asBiz" class="hidden" aria-label="Business"></select><select id="asNum" aria-label="Active number"></select></header>
       <main class="main"><div class="page" id="page"></div></main>
       <nav class="nav">${TABS.map(([k, label]) => html`<button data-tab="${k}">${new Raw(ICON[k])}<span>${label}</span><i class="badge hidden"></i></button>`)}</nav>
     </div>`);
     $('.nav').addEventListener('click', (e) => { const b = e.target.closest('[data-tab]'); if (b) location.hash = b.dataset.tab; });
+    $('#asBiz').addEventListener('change', (e) => switchBusiness(e.target.value).catch((err) => toast(err.message)));
     $('#asNum').addEventListener('change', (e) => { state.numberId = e.target.value; store.set('numberId', state.numberId); render(); });
   }
   paintHeader(); paintBadges();
@@ -132,6 +145,10 @@ function render() {
 }
 
 function paintHeader() {
+  $('#coName').textContent = state.company;
+  const biz = $('#asBiz'); const many = state.businesses.length > 1;
+  biz.classList.toggle('hidden', !many); $('#coName').classList.toggle('hidden', many);
+  if (many) put(biz, html`${state.businesses.map((b) => html`<option value="${b.id}" ${b.id === state.me.tenant_id ? new Raw('selected') : ''}>${b.name}</option>`)}`);
   const sel = $('#asNum');
   if (!state.numbers.length) { sel.classList.add('hidden'); return; }
   sel.classList.remove('hidden');
@@ -159,7 +176,7 @@ function renderAuth(app) {
       const body = Object.fromEntries(new FormData(e.target));
       try {
         const r = await api('POST', mode === 'login' ? '/login' : '/signup', body, { quiet: true });
-        state.me = r.user; state.company = r.company; await afterLogin(); location.hash = 'keypad'; render();
+        applyMe(r); await afterLogin(); location.hash = 'keypad'; render();
       } catch (err) { $('#authErr').textContent = err.message; }
     };
   };
@@ -202,8 +219,8 @@ function renderKeypad() {
 }
 
 function emptyNumbers() {
-  return html`<div class="empty"><h2>No numbers yet</h2><p>${isOwner() ? 'Connect Twilio or Bird to bring your numbers in.' : 'Ask your account owner to connect a provider.'}</p>
-    ${isOwner() ? html`<button class="btn brand" onclick="location.hash='settings'">Connect a provider</button>` : ''}</div>`;
+  return html`<div class="empty"><h2>No numbers yet</h2><p>${isOwner() ? 'Connect Twilio or Bird to bring your numbers in, or move numbers here from the Businesses tab.' : isAdmin() ? 'Ask the owner to add numbers to this business.' : 'No numbers are assigned to you yet. Ask an admin to assign one.'}</p>
+    ${isOwner() ? html`<button class="btn brand" onclick="location.hash='settings'">Open settings</button>` : ''}</div>`;
 }
 
 const rtc = { devices: new Map(), overlay: null };
@@ -390,128 +407,236 @@ async function renderVoicemail() {
 }
 
 /* ───────── settings ───────── */
+const guard = (fn) => async (...a) => { try { await fn(...a); } catch (e) { toast(e.message); } };
+const ringLabel = { all: 'Ring everyone at once', sequence: 'Ring one at a time, in order' };
+
 async function renderSettings() {
   const page = $('#page');
-  put(page, html`<div class="empty">Loading…</div>`);
-  const [nums, gs, cs, team] = await Promise.all([
-    api('GET', '/numbers'), api('GET', '/greetings'), api('GET', '/connections'), api('GET', '/team'),
-  ]).catch((e) => { toast(e.message); return []; });
-  if (!nums) return;
-  state.numbers = nums.numbers;
-  const greetings = gs.greetings; const owner = isOwner();
-
-  put(page, html`
-    ${state.needsPublicUrl && owner ? html`<div class="card"><strong>Set PUBLIC_URL on the server.</strong><div class="small muted">Webhooks and "Connect" need the app's public https address (for example https://phone.example.com).</div></div>` : ''}
-
-    <div class="card stack" id="greetCard">
-      <div><h2>Voicemail greetings</h2><div class="small muted">Record in your browser or upload any audio file (up to ${MAX_SECONDS}s). Then pick it for each number below.</div></div>
-      ${owner ? html`
-      <div class="stack" id="recorder">
-        <input id="gName" placeholder="Name, e.g. Business hours" maxlength="60">
-        <div class="row wrap"><button class="btn danger" id="recBtn">● Record</button><label class="btn ghost" style="display:inline-flex;align-items:center">Upload audio<input id="gFile" type="file" accept="audio/*" hidden></label></div>
-        <div class="rec hidden" id="recLive"><span id="recTime">0:00</span><div class="meter"><i id="recMeter"></i></div></div>
-        <div class="hidden stack" id="gPreview"><audio controls id="gAudio"></audio><div class="row"><button class="btn brand" id="gSave">Save greeting</button><button class="btn ghost" id="gDiscard">Discard</button></div></div>
-      </div>` : ''}
-      <ul class="list" id="gList">${greetings.length ? greetings.map((g) => html`<li data-g="${g.id}"><div class="grow"><strong>${g.name}</strong><div class="small muted">${clock(g.seconds)}${g.used_by ? ` · used by ${g.used_by} number${g.used_by > 1 ? 's' : ''}` : ''}</div></div>
-        <button class="btn sm ghost" data-play="${g.id}">Play</button>${owner ? html`<button class="btn sm ghost" data-gdel="${g.id}">Delete</button>` : ''}</li>`)
-        : html`<li class="muted small">No greetings yet. Callers will hear a standard "leave a message" prompt.</li>`}</ul>
-    </div>
-
-    <div class="card"><h2>Numbers</h2><div class="small muted" style="margin-bottom:6px">Greeting, ring time and an optional cell phone to ring along with the app.</div>
-      ${nums.numbers.length ? nums.numbers.map((n) => html`<div class="stack" data-n="${n.id}" style="padding:12px 0;border-top:1px solid var(--line)">
-        <div class="row"><strong class="grow">${pretty(n.e164)}</strong><span class="pill">${n.provider}${n.canCall ? '' : ' · text only'}</span></div>
-        <label class="f">Name<input data-f="label" value="${n.label}" ${owner ? '' : new Raw('disabled')}></label>
-        ${n.canCall ? html`
-        <label class="f">Voicemail greeting<select data-f="greeting_id" ${owner ? '' : new Raw('disabled')}><option value="">Standard prompt</option>${greetings.map((g) => html`<option value="${g.id}" ${g.id === n.greeting_id ? new Raw('selected') : ''}>${g.name}</option>`)}</select></label>
-        <div class="row"><label class="f grow">Also ring my cell<input data-f="forward_to" type="tel" placeholder="(555) 123-4567" value="${n.forward_to || ''}" ${owner ? '' : new Raw('disabled')}></label>
-          <label class="f" style="width:110px">Ring (sec)<input data-f="ring_seconds" type="number" min="5" max="60" value="${n.ring_seconds}" ${owner ? '' : new Raw('disabled')}></label></div>` : html`<div class="small muted">Voicemail isn't available on Bird numbers yet.</div>`}
-        ${owner ? html`<button class="btn sm" data-save="${n.id}">Save</button>` : ''}</div>`)
-        : html`<div class="empty">No numbers yet. Connect a provider below.</div>`}</div>
-
-    <div class="card stack"><h2>Providers</h2>
-      ${cs.connections.length ? html`<ul class="list">${cs.connections.map((c) => html`<li><div class="grow"><strong>${c.label}</strong> <span class="pill">${c.provider}</span><div class="small muted">${c.numbers} number${c.numbers === 1 ? '' : 's'}</div>
-        ${c.webhookUrl ? html`<div class="small">Bird inbound webhook (paste in Bird):<input readonly value="${c.webhookUrl}" onclick="this.select()"></div>` : ''}</div>
-        ${owner ? html`${c.provider === 'twilio' ? html`<button class="btn sm ghost" data-resync="${c.id}">Sync</button>` : ''}<button class="btn sm ghost" data-cdel="${c.id}">Remove</button>` : ''}</li>`)}</ul>` : ''}
-      ${owner ? html`
-      <div class="seg" id="provSeg"><button data-p="twilio" class="on">Twilio</button><button data-p="bird">Bird</button></div>
-      <form class="stack" id="twForm"><label class="f">Account SID<input name="accountSid" placeholder="AC…" autocomplete="off" required></label><label class="f">Auth Token<input name="authToken" type="password" autocomplete="off" required></label>
-        <div class="small muted">One tap: we create the API key + calling app, import your numbers, and point their voice and text webhooks here.</div><div class="err" id="twErr"></div><button class="btn brand">Connect Twilio</button></form>
-      <form class="stack hidden" id="brForm"><label class="f">Access key<input name="accessKey" type="password" autocomplete="off" required></label><label class="f">Workspace ID<input name="workspaceId" required></label><label class="f">SMS channel ID<input name="channelId" required></label><label class="f">Channel phone number<input name="number" type="tel" placeholder="+1…" required></label>
-        <div class="small muted">Texting only for now. After connecting, copy the webhook URL into Bird so inbound texts arrive here.</div><div class="err" id="brErr"></div><button class="btn brand">Connect Bird</button></form>` : ''}
-    </div>
-
-    <div class="card stack"><h2>Team</h2>
-      <ul class="list">${team.users.map((u) => html`<li><div class="grow"><strong>${u.name || u.email}</strong><div class="small muted">${u.email} · ${u.role}</div></div>${owner && u.id !== state.me.id ? html`<button class="btn sm ghost" data-udel="${u.id}">Remove</button>` : ''}</li>`)}</ul>
-      ${owner ? html`<form class="stack" id="teamForm"><div class="row"><input name="name" placeholder="Name"><input name="email" type="email" placeholder="Email" required></div><div class="row"><input name="password" type="password" placeholder="Temporary password (8+)" minlength="8" required><button class="btn">Add</button></div><div class="err" id="teamErr"></div></form>` : ''}
-    </div>
-
-    <div class="card stack"><h2>This device</h2>
-      <div class="small muted">Install: on iPhone tap Share → Add to Home Screen. On Android tap ⋮ → Install app. On desktop use the install icon in the address bar.</div>
-      <div class="row wrap">${state.installEvt ? html`<button class="btn" id="installBtn">Install app</button>` : ''}<button class="btn ghost" id="logoutBtn">Sign out</button></div>
-    </div>`);
-  wireSettings(page, greetings);
+  const tabs = [['numbers', 'Numbers'], ...(isAdmin() ? [['people', 'People']] : []), ...(isOwner() ? [['providers', 'Providers']] : []),
+    ...(state.me.is_platform_admin ? [['businesses', 'Businesses']] : []), ['account', 'Account']];
+  if (!tabs.some((t) => t[0] === state.settingsTab)) state.settingsTab = 'numbers';
+  put(page, html`<div class="seg" id="setSeg">${tabs.map(([k, l]) => html`<button data-s="${k}" class="${k === state.settingsTab ? 'on' : ''}">${l}</button>`)}</div><div id="setBody"><div class="empty">Loading…</div></div>`);
+  $('#setSeg').onclick = (e) => { const b = e.target.closest('[data-s]'); if (b) { state.settingsTab = b.dataset.s; renderSettings(); } };
+  const body = $('#setBody');
+  try { await ({ numbers: tabNumbers, people: tabPeople, providers: tabProviders, businesses: tabBusinesses, account: tabAccount })[state.settingsTab](body); }
+  catch (e) { put(body, html`<div class="empty">${e.message}</div>`); }
 }
 
-function wireSettings(page, greetings) {
-  const refresh = async () => { await loadNumbers(); paintHeader(); renderSettings(); };
-  const guard = (fn) => async (...a) => { try { await fn(...a); } catch (e) { toast(e.message); } };
+/* ---- greeting recorder (one per number card) ---- */
+const recorderHtml = () => html`<div class="stack recorder">
+  <input class="r-name" placeholder="Name, e.g. After hours" maxlength="60">
+  <div class="row wrap"><button type="button" class="btn danger r-rec">● Record</button>
+    <label class="btn ghost" style="display:inline-flex;align-items:center">Upload audio<input class="r-file" type="file" accept="audio/*" hidden></label></div>
+  <div class="rec hidden r-live"><span class="r-time">0:00</span><div class="meter"><i class="r-meter"></i></div></div>
+  <div class="hidden stack r-prev"><audio controls class="r-audio"></audio>
+    <div class="row"><button type="button" class="btn brand r-save">Save and use for this number</button><button type="button" class="btn ghost r-discard">Discard</button></div></div>
+</div>`;
 
-  page.onclick = guard(async (e) => { // assigned (not added) so re-renders never stack handlers
-    const t = e.target;
-    const play = t.closest('[data-play]'); if (play) { const a = new Audio(`/api/greetings/${play.dataset.play}/audio`); a.play(); return; }
-    const gd = t.closest('[data-gdel]'); if (gd && confirm('Delete this greeting? Numbers using it fall back to the standard prompt.')) { await api('DELETE', `/greetings/${gd.dataset.gdel}`); return refresh(); }
-    const sv = t.closest('[data-save]');
-    if (sv) {
-      const box = sv.closest('[data-n]'); const body = {};
-      box.querySelectorAll('[data-f]').forEach((i) => { body[i.dataset.f] = i.value; });
-      await api('PATCH', `/numbers/${sv.dataset.save}`, body); toast('Saved'); await loadNumbers(); paintHeader(); return renderSettings();
+function mountRecorder(root, { numberId, onSaved }) {
+  const $r = (s) => $(s, root);
+  const rec = { handle: null, wav: null };
+  const show = (s, on) => $r(s).classList.toggle('hidden', !on);
+  const preview = (wav) => { rec.wav = wav; $r('.r-audio').src = URL.createObjectURL(wav.blob); show('.r-prev', true); show('.r-live', false); $r('.r-rec').textContent = '● Record'; };
+  $r('.r-rec').onclick = guard(async () => {
+    if (rec.handle) { const h = rec.handle; rec.handle = null; return preview(h.stop()); }
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error('Recording needs https and a microphone');
+    try {
+      rec.handle = await startRecording((level, secs) => {
+        $r('.r-meter').style.width = Math.min(100, level * 140) + '%'; $r('.r-time').textContent = clock(secs);
+        if (secs >= MAX_SECONDS && rec.handle) { const h = rec.handle; rec.handle = null; preview(h.stop()); }
+      });
+    } catch { throw new Error('Allow microphone access to record'); }
+    show('.r-live', true); show('.r-prev', false); $r('.r-rec').textContent = '■ Stop';
+  });
+  $r('.r-file').onchange = guard(async (e) => {
+    const f = e.target.files[0]; if (!f) return;
+    const w = await fileToWav(f);
+    if (!$r('.r-name').value) $r('.r-name').value = f.name.replace(/\.[^.]+$/, '').slice(0, 60);
+    preview(w); e.target.value = '';
+  });
+  $r('.r-discard').onclick = () => { rec.wav = null; show('.r-prev', false); };
+  $r('.r-save').onclick = guard(async () => {
+    if (!rec.wav) return;
+    const name = $r('.r-name').value.trim() || 'Greeting';
+    await api('POST', `/greetings?name=${encodeURIComponent(name)}&seconds=${rec.wav.seconds}&numberId=${numberId}`, rec.wav.blob);
+    toast('Greeting saved and active'); onSaved();
+  });
+}
+
+/* ---- numbers ---- */
+function peopleRows(n, team) {
+  const inOrder = n.people.map((p) => team.find((u) => u.id === p.id)).filter(Boolean);
+  const rest = team.filter((u) => !n.people.some((p) => p.id === u.id));
+  return [...inOrder.map((u) => [u, true]), ...rest.map((u) => [u, false])];
+}
+
+async function tabNumbers(body) {
+  const admin = isAdmin();
+  const [nums, gs, team] = await Promise.all([api('GET', '/numbers'), api('GET', '/greetings'), admin ? api('GET', '/team') : { users: [] }]);
+  state.numbers = nums.numbers; paintHeader();
+  if (!nums.numbers.length) return put(body, emptyNumbers());
+  put(body, html`${state.needsPublicUrl && admin ? html`<div class="card"><strong>Set PUBLIC_URL on the server.</strong><div class="small muted">Webhooks need the app's public https address.</div></div>` : ''}
+    ${nums.numbers.map((n) => html`<div class="card stack" data-n="${n.id}">
+      <div class="row"><strong class="grow" style="font-size:18px">${pretty(n.e164)}</strong><span class="pill">${n.provider}${n.canCall ? '' : ' · text only'}</span></div>
+      ${admin ? html`<label class="f">Name<input data-f="label" value="${n.label}" maxlength="60"></label>` : html`<div class="muted">${n.label}</div>`}
+
+      ${n.canCall ? html`
+      ${admin ? html`<div><div class="small muted" style="margin-bottom:6px">Who gets calls to this number (tick people; use ▲▼ to set the order)</div>
+        <div class="people">${team.users.length ? peopleRows(n, team.users).map(([u, on]) => html`<div class="row" data-u="${u.id}" style="padding:4px 0">
+          <input type="checkbox" style="width:22px;min-height:22px" ${on ? new Raw('checked') : ''}><span class="grow">${u.name || u.email} <span class="small muted">${u.role}</span></span>
+          <button type="button" class="btn sm ghost" data-up>▲</button><button type="button" class="btn sm ghost" data-down>▼</button></div>`)
+          : html`<div class="small muted">Add people on the People tab first.</div>`}</div>
+        <div class="small muted">If nobody is ticked, the owners and admins get the call.</div></div>
+      <label class="f">Ringing<select data-f="ring_mode">${Object.entries(ringLabel).map(([k, v]) => html`<option value="${k}" ${n.ring_mode === k ? new Raw('selected') : ''}>${v}</option>`)}</select></label>
+      <div class="row"><label class="f grow">Also ring this cell<input data-f="forward_to" type="tel" placeholder="(555) 123-4567" value="${n.forward_to || ''}"></label>
+        <label class="f" style="width:110px">Ring (sec)<input data-f="ring_seconds" type="number" min="5" max="60" value="${n.ring_seconds}"></label></div>` : html`<div class="small muted">Rings: ${n.people.length ? n.people.map((p) => p.name).join(', ') : 'owners and admins'}</div>`}
+
+      <div class="stack"><label class="f">Voicemail greeting
+        <div class="row"><select data-f="greeting_id" class="grow"><option value="">Standard prompt</option>${gs.greetings.filter((g) => !g.number_id || g.number_id === n.id).map((g) => html`<option value="${g.id}" ${g.id === n.greeting_id ? new Raw('selected') : ''}>${g.name} (${clock(g.seconds)})</option>`)}</select>
+          <button type="button" class="btn sm ghost" data-play>Play</button></div></label>
+        <details><summary class="small" style="cursor:pointer;color:var(--accent)">Record or upload a new greeting</summary><div style="margin-top:10px" class="rec-slot">${recorderHtml()}</div></details></div>` : html`<div class="small muted">Voicemail and calling aren't available on Bird numbers yet.</div>`}
+      <button class="btn sm" data-save>Save</button></div>`)}`);
+
+  body.querySelectorAll('[data-n]').forEach((card) => {
+    const n = nums.numbers.find((x) => x.id === card.dataset.n);
+    const slot = $('.rec-slot', card);
+    if (slot) mountRecorder(slot, { numberId: n.id, onSaved: () => tabNumbers(body) });
+    card.addEventListener('click', guard(async (e) => {
+      const row = e.target.closest('[data-u]');
+      if (e.target.closest('[data-up]') && row.previousElementSibling) row.parentNode.insertBefore(row, row.previousElementSibling);
+      if (e.target.closest('[data-down]') && row.nextElementSibling) row.parentNode.insertBefore(row.nextElementSibling, row);
+      if (e.target.closest('[data-play]')) { const g = $('[data-f=greeting_id]', card).value; if (g) new Audio(`/api/greetings/${g}/audio`).play(); else toast('That is the standard prompt'); }
+      if (e.target.closest('[data-save]')) {
+        const patch = { greeting_id: $('[data-f=greeting_id]', card)?.value || null };
+        if (admin) {
+          patch.label = $('[data-f=label]', card).value;
+          if (n.canCall) {
+            patch.people = [...card.querySelectorAll('[data-u]')].filter((r) => $('input', r).checked).map((r) => r.dataset.u);
+            patch.ring_mode = $('[data-f=ring_mode]', card).value;
+            patch.forward_to = $('[data-f=forward_to]', card).value;
+            patch.ring_seconds = $('[data-f=ring_seconds]', card).value;
+          }
+        } else if (!n.canCall) return;
+        if (!n.canCall) delete patch.greeting_id;
+        await api('PATCH', `/numbers/${n.id}`, patch); toast('Saved'); await tabNumbers(body);
+      }
+    }));
+  });
+}
+
+/* ---- people ---- */
+async function tabPeople(body) {
+  const [team, nums] = await Promise.all([api('GET', '/team'), api('GET', '/numbers')]);
+  const owner = isOwner();
+  const numberBoxes = (sel = []) => nums.numbers.length ? nums.numbers.map((n) => html`<label class="row small" style="padding:3px 0"><input type="checkbox" value="${n.id}" style="width:20px;min-height:20px" ${sel.includes(n.id) ? new Raw('checked') : ''}>${n.label} · ${pretty(n.e164)}</label>`) : html`<div class="small muted">No numbers in this business yet.</div>`;
+  put(body, html`<div class="card"><h2>People in ${state.company}</h2><div class="small muted" style="margin-bottom:6px">Members only see the numbers you tick for them.</div>
+    <ul class="list">${team.users.map((u) => html`<li data-p="${u.id}" style="flex-wrap:wrap;align-items:flex-start">
+      <div class="grow"><strong>${u.name || u.email}</strong><div class="small muted">${u.email}</div></div>
+      <span class="pill">${u.role}</span>
+      <details style="width:100%"><summary class="small" style="cursor:pointer;color:var(--accent)">Numbers and role</summary><div class="stack" style="margin-top:8px">
+        <div class="nums">${numberBoxes(u.number_ids)}</div>
+        ${owner && u.role !== 'owner' && u.id !== state.me.id ? html`<label class="f">Role<select data-role><option value="member" ${u.role === 'member' ? new Raw('selected') : ''}>Member</option><option value="admin" ${u.role === 'admin' ? new Raw('selected') : ''}>Admin</option></select></label>` : ''}
+        <div class="row"><button class="btn sm" data-save>Save</button>${u.id !== state.me.id ? html`<button class="btn sm ghost" data-del>Remove</button>` : ''}</div></div></details></li>`)}</ul></div>
+    <form class="card stack" id="addPerson"><h2>Add a person</h2>
+      <div class="row"><input name="name" placeholder="Name"><input name="email" type="email" placeholder="Email" required></div>
+      <input name="password" type="password" minlength="8" placeholder="Temporary password (skip if they already have an account)">
+      ${owner ? html`<label class="f">Role<select name="role"><option value="member">Member</option><option value="admin">Admin</option></select></label>` : ''}
+      <div><div class="small muted">Numbers they can use</div><div class="nums">${numberBoxes()}</div></div>
+      <div class="err" id="addErr"></div><button class="btn brand">Add person</button></form>`);
+  const checked = (root) => [...root.querySelectorAll('.nums input:checked')].map((i) => i.value);
+  body.querySelector('.list').addEventListener('click', guard(async (e) => {
+    const li = e.target.closest('[data-p]'); if (!li) return;
+    if (e.target.closest('[data-save]')) {
+      const patch = { numberIds: checked(li) }; const role = $('[data-role]', li); if (role) patch.role = role.value;
+      await api('PATCH', `/team/${li.dataset.p}`, patch); toast('Saved'); tabPeople(body);
     }
+    if (e.target.closest('[data-del]') && confirm('Remove this person from the business?')) { await api('DELETE', `/team/${li.dataset.p}`); tabPeople(body); }
+  }));
+  $('#addPerson').onsubmit = async (e) => {
+    e.preventDefault(); const f = e.target; const data = Object.fromEntries(new FormData(f)); data.numberIds = checked(f);
+    try { const r = await api('POST', '/team', data); toast(r.existed ? 'Added. They use their existing login.' : 'Person added. Share the temporary password with them.'); tabPeople(body); }
+    catch (err) { $('#addErr').textContent = err.message; }
+  };
+}
+
+/* ---- providers ---- */
+async function tabProviders(body) {
+  const cs = await api('GET', '/connections');
+  put(body, html`<div class="card stack"><h2>Providers</h2>
+    ${cs.connections.length ? html`<ul class="list">${cs.connections.map((c) => html`<li><div class="grow"><strong>${c.label}</strong> <span class="pill">${c.provider}</span>
+      <div class="small muted">${c.numbers} number${c.numbers === 1 ? '' : 's'}${state.me.is_platform_admin ? ` · ${c.business}` : ''}</div>
+      ${c.webhookUrl ? html`<div class="small">Bird inbound webhook (paste in Bird):<input readonly value="${c.webhookUrl}" onclick="this.select()"></div>` : ''}</div>
+      ${c.provider === 'twilio' ? html`<button class="btn sm ghost" data-resync="${c.id}">Sync</button>` : ''}<button class="btn sm ghost" data-cdel="${c.id}">Remove</button></li>`)}</ul>` : html`<div class="small muted">Nothing connected yet.</div>`}
+    <div class="seg" id="provSeg"><button data-p="twilio" class="on">Twilio</button><button data-p="bird">Bird</button></div>
+    <form class="stack" id="twForm"><label class="f">Account SID<input name="accountSid" placeholder="AC…" autocomplete="off" required></label><label class="f">Auth Token<input name="authToken" type="password" autocomplete="off" required></label>
+      <div class="small muted">We create the API key and calling app, import your numbers and point their voice and text webhooks here. New numbers land in ${state.company}; move them to other businesses from the Businesses tab.</div><div class="err" id="twErr"></div><button class="btn brand">Connect Twilio</button></form>
+    <form class="stack hidden" id="brForm"><label class="f">Access key<input name="accessKey" type="password" autocomplete="off" required></label><label class="f">Workspace ID<input name="workspaceId" required></label><label class="f">SMS channel ID<input name="channelId" required></label><label class="f">Channel phone number<input name="number" type="tel" placeholder="+1…" required></label>
+      <div class="small muted">Texting only for now. After connecting, copy the webhook URL into Bird so inbound texts arrive.</div><div class="err" id="brErr"></div><button class="btn brand">Connect Bird</button></form></div>`);
+  const refresh = async () => { await loadNumbers(); paintHeader(); tabProviders(body); };
+  body.onclick = guard(async (e) => {
+    const t = e.target;
     const rs = t.closest('[data-resync]'); if (rs) { rs.disabled = true; const r = await api('POST', `/connections/${rs.dataset.resync}/resync`, {}); toast(r.added.length ? `Added ${r.added.length} number(s)` : 'Up to date'); return refresh(); }
     const cd = t.closest('[data-cdel]'); if (cd && confirm('Remove this provider and its numbers, messages and voicemail from the app? (Nothing changes in your Twilio/Bird account.)')) { await api('DELETE', `/connections/${cd.dataset.cdel}`); return refresh(); }
-    const ud = t.closest('[data-udel]'); if (ud && confirm('Remove this person?')) { await api('DELETE', `/team/${ud.dataset.udel}`); return renderSettings(); }
-    if (t.closest('#logoutBtn')) { await api('POST', '/logout', {}); state.me = null; rtc.devices.forEach((p) => p.then((d) => d.destroy()).catch(() => {})); rtc.devices.clear(); $('#app').innerHTML = ''; return render(); }
-    if (t.closest('#installBtn')) { state.installEvt.prompt(); }
     const seg = t.closest('#provSeg [data-p]');
-    if (seg) { page.querySelectorAll('#provSeg button').forEach((b) => b.classList.toggle('on', b === seg)); $('#twForm').classList.toggle('hidden', seg.dataset.p !== 'twilio'); $('#brForm').classList.toggle('hidden', seg.dataset.p !== 'bird'); }
+    if (seg) { body.querySelectorAll('#provSeg button').forEach((b) => b.classList.toggle('on', b === seg)); $('#twForm').classList.toggle('hidden', seg.dataset.p !== 'twilio'); $('#brForm').classList.toggle('hidden', seg.dataset.p !== 'bird'); }
   });
-
   const submit = (sel, errSel, path, done) => {
-    const f = $(sel, page); if (!f) return;
+    const f = $(sel, body);
     f.onsubmit = async (e) => {
-      e.preventDefault(); const btn = f.querySelector('button:not([type=button])'); btn.disabled = true; $(errSel).textContent = '';
-      try { const r = await api('POST', path, Object.fromEntries(new FormData(f))); await done(r); } catch (err) { $(errSel).textContent = err.message; } finally { btn.disabled = false; }
+      e.preventDefault(); const btn = f.querySelector('button'); btn.disabled = true; $(errSel).textContent = '';
+      try { await done(await api('POST', path, Object.fromEntries(new FormData(f)))); } catch (err) { $(errSel).textContent = err.message; } finally { btn.disabled = false; }
     };
   };
   submit('#twForm', '#twErr', '/connections/twilio', async (r) => { toast(`Imported ${r.added.length} number(s)${r.warnings.length ? ' · some webhooks need attention' : ''}`); await refresh(); registerDevices(); });
   submit('#brForm', '#brErr', '/connections/bird', async () => { toast('Bird connected. Copy its webhook URL into Bird.'); await refresh(); });
-  submit('#teamForm', '#teamErr', '/team', async () => { toast('Person added'); renderSettings(); });
+}
 
-  // greeting recorder
-  const rec = { handle: null, wav: null };
-  const show = (id, on) => $(id, page)?.classList.toggle('hidden', !on);
-  const preview = (wav) => { rec.wav = wav; $('#gAudio', page).src = URL.createObjectURL(wav.blob); show('#gPreview', true); show('#recLive', false); $('#recBtn', page).textContent = '● Record'; };
-  const recBtn = $('#recBtn', page);
-  if (recBtn) {
-    recBtn.onclick = guard(async () => {
-      if (rec.handle) { const h = rec.handle; rec.handle = null; return preview(h.stop()); }
-      if (!navigator.mediaDevices?.getUserMedia) throw new Error('Recording needs https and a microphone');
-      try {
-        rec.handle = await startRecording((level, secs) => {
-          $('#recMeter', page).style.width = Math.min(100, level * 140) + '%'; $('#recTime', page).textContent = clock(secs);
-          if (secs >= MAX_SECONDS && rec.handle) { const h = rec.handle; rec.handle = null; preview(h.stop()); }
-        });
-      } catch { throw new Error('Allow microphone access to record'); }
-      show('#recLive', true); show('#gPreview', false); recBtn.textContent = '■ Stop';
-    });
-    $('#gFile', page).onchange = guard(async (e) => { const f = e.target.files[0]; if (!f) return; const w = await fileToWav(f); if (!$('#gName', page).value) $('#gName', page).value = f.name.replace(/\.[^.]+$/, '').slice(0, 60); preview(w); e.target.value = ''; });
-    $('#gDiscard', page).onclick = () => { rec.wav = null; show('#gPreview', false); };
-    $('#gSave', page).onclick = guard(async () => {
-      if (!rec.wav) return; const name = $('#gName', page).value.trim() || 'Greeting';
-      await api('POST', `/greetings?name=${encodeURIComponent(name)}&seconds=${rec.wav.seconds}`, rec.wav.blob);
-      toast('Greeting saved. Pick it for a number below.'); renderSettings();
-    });
-  }
-  void greetings;
+/* ---- businesses (operator) ---- */
+async function tabBusinesses(body) {
+  const [bs, all] = await Promise.all([api('GET', '/businesses'), api('GET', '/admin/numbers')]);
+  put(body, html`<div class="card"><h2>Businesses</h2><div class="small muted" style="margin-bottom:6px">Each business has its own people, numbers, messages and voicemail. You can open any of them.</div>
+    <ul class="list">${bs.businesses.map((b) => html`<li data-b="${b.id}"><div class="grow"><strong>${b.name}</strong><div class="small muted">${b.numbers} number${b.numbers === 1 ? '' : 's'} · ${b.people} ${b.people === 1 ? 'person' : 'people'}</div></div>
+      ${b.id === state.me.tenant_id ? html`<span class="pill">current</span>` : html`<button class="btn sm" data-go>Open</button><button class="btn sm ghost" data-del>Delete</button>`}</li>`)}</ul></div>
+    <form class="card stack" id="newBiz"><h2>New business</h2><input name="name" placeholder="Business name" maxlength="80" required><div class="err" id="bizErr"></div><button class="btn brand">Create</button></form>
+    <div class="card"><h2>Assign numbers to businesses</h2><div class="small muted" style="margin-bottom:6px">Moving a number takes its texts, calls and voicemail with it and clears who was assigned to it.</div>
+      <ul class="list">${all.numbers.map((n) => html`<li data-num="${n.id}"><div class="grow"><strong>${pretty(n.e164)}</strong><div class="small muted">${n.label} · ${n.provider}</div></div>
+        <select data-move style="max-width:55%">${bs.businesses.map((b) => html`<option value="${b.id}" ${b.id === n.tenant_id ? new Raw('selected') : ''}>${b.name}</option>`)}</select></li>`)}</ul>
+      ${all.numbers.length ? '' : html`<div class="empty">No numbers yet. Connect Twilio on the Providers tab.</div>`}</div>`);
+  body.onclick = guard(async (e) => {
+    const li = e.target.closest('[data-b]'); if (!li) return;
+    if (e.target.closest('[data-go]')) { await switchBusiness(li.dataset.b); }
+    if (e.target.closest('[data-del]') && confirm('Delete this business? It must have no numbers or providers.')) { await api('DELETE', `/businesses/${li.dataset.b}`); tabBusinesses(body); }
+  });
+  body.onchange = guard(async (e) => {
+    const sel = e.target.closest('[data-move]'); if (!sel) return;
+    const li = sel.closest('[data-num]'); const name = sel.options[sel.selectedIndex].text;
+    if (!confirm(`Move this number to ${name}? Its history moves too and assignments reset.`)) return tabBusinesses(body);
+    await api('POST', `/numbers/${li.dataset.num}/move`, { tenantId: sel.value }); toast(`Moved to ${name}`); await loadNumbers(); paintHeader(); tabBusinesses(body);
+  });
+  $('#newBiz').onsubmit = async (e) => {
+    e.preventDefault();
+    try { await api('POST', '/businesses', { name: new FormData(e.target).get('name') }); toast('Business created'); tabBusinesses(body); }
+    catch (err) { $('#bizErr').textContent = err.message; }
+  };
+}
+
+/* ---- account ---- */
+async function tabAccount(body) {
+  put(body, html`<div class="card stack"><h2>${state.me.name || state.me.email}</h2><div class="small muted">${state.me.email} · ${state.me.is_platform_admin ? 'operator' : state.me.role} in ${state.company}</div></div>
+    <form class="card stack" id="pwForm"><h2>Change password</h2><input name="current" type="password" placeholder="Current password" autocomplete="current-password" required>
+      <input name="next" type="password" placeholder="New password (8+ characters)" minlength="8" autocomplete="new-password" required><div class="err" id="pwErr"></div><button class="btn">Update password</button></form>
+    <div class="card stack"><h2>This device</h2>
+      <div class="small muted">Install: on iPhone tap Share → Add to Home Screen. On Android tap ⋮ → Install app. On desktop use the install icon in the address bar.</div>
+      <div class="row wrap">${state.installEvt ? html`<button class="btn" id="installBtn">Install app</button>` : ''}<button class="btn ghost" id="logoutBtn">Sign out</button></div></div>`);
+  $('#pwForm').onsubmit = async (e) => {
+    e.preventDefault();
+    try { await api('POST', '/password', Object.fromEntries(new FormData(e.target))); toast('Password updated'); e.target.reset(); $('#pwErr').textContent = ''; }
+    catch (err) { $('#pwErr').textContent = err.message; }
+  };
+  $('#installBtn')?.addEventListener('click', () => state.installEvt.prompt());
+  $('#logoutBtn').onclick = guard(async () => {
+    await api('POST', '/logout', {}); state.me = null; rtc.devices.forEach((p) => p.then((d) => d.destroy()).catch(() => {})); rtc.devices.clear(); $('#app').innerHTML = ''; render();
+  });
 }
 
 boot();

@@ -86,6 +86,34 @@ CREATE TABLE IF NOT EXISTS voicemails (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS voicemails_recent_idx ON voicemails (tenant_id, created_at DESC);
+
+-- v2: one operator login across many businesses, people assigned to numbers.
+-- Everything below is idempotent; the backfills only touch rows that still need it.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS is_platform_admin boolean NOT NULL DEFAULT false;
+CREATE TABLE IF NOT EXISTS memberships (
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  role text NOT NULL DEFAULT 'member' CHECK (role IN ('owner','admin','member')),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, tenant_id)
+);
+INSERT INTO memberships (user_id, tenant_id, role)
+  SELECT id, tenant_id, CASE WHEN role IN ('owner','admin') THEN role ELSE 'member' END FROM users
+  ON CONFLICT DO NOTHING;
+UPDATE users SET is_platform_admin = true
+  WHERE id = (SELECT id FROM users ORDER BY created_at LIMIT 1)
+    AND NOT EXISTS (SELECT 1 FROM users WHERE is_platform_admin);
+CREATE TABLE IF NOT EXISTS number_members (
+  number_id uuid NOT NULL REFERENCES numbers(id) ON DELETE CASCADE,
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  position integer NOT NULL DEFAULT 0,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (number_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS number_members_user_idx ON number_members (user_id);
+ALTER TABLE numbers ADD COLUMN IF NOT EXISTS ring_mode text NOT NULL DEFAULT 'all';
+ALTER TABLE greetings ADD COLUMN IF NOT EXISTS number_id uuid REFERENCES numbers(id) ON DELETE CASCADE;
+ALTER TABLE greetings ADD COLUMN IF NOT EXISTS created_by uuid REFERENCES users(id) ON DELETE SET NULL;
 `;
 
 function createPool(url = process.env.DATABASE_URL) {
