@@ -4,8 +4,8 @@ A multi-tenant phone system as an installable web app (PWA): keypad, calls, SMS,
 and voicemail greetings you record or upload in the browser. One link, add to home screen,
 works the same on phone and desktop.
 
-It is a self-contained app. Nothing in the main Hauler Fuel server imports it, and it has its own
-`package.json` and database tables.
+It is a standalone app with its own
+`package.json` and database tables, separate from Hauler Fuel.
 
 ## What v1 does
 
@@ -32,7 +32,7 @@ are unaffected.
 ## Run it
 
 ```bash
-cd phone
+# (from the repo root)
 npm install
 export DATABASE_URL=postgres://user:pass@localhost:5432/phone
 export APP_SECRET=$(openssl rand -hex 32)      # encrypts provider credentials + signs sessions; keep it stable
@@ -50,7 +50,7 @@ npm start
 
 ## Deploy (Render)
 
-New Web Service from this repo: Root Directory `phone`, Build `npm install`, Start `npm start`,
+New Web Service from this repo: leave Root Directory blank, Build `npm install`, Start `npm start`,
 plus a Postgres database and the env vars above. Use the generated `https://…onrender.com` URL (or a custom domain) as `PUBLIC_URL`.
 
 ## Connect your numbers
